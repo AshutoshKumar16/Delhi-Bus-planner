@@ -36,7 +36,8 @@ Verifications:
 import json
 import time
 import unittest
-from backend_service import app, initialize_engine
+from unittest.mock import patch
+from backend_service import app, initialize_engine, get_latest_snapshot
 
 
 class TestBackendAPI(unittest.TestCase):
@@ -46,10 +47,18 @@ class TestBackendAPI(unittest.TestCase):
         print("DELHI BUS PROJECT: BACKEND API INTEGRATION TEST SUITE")
         print("=" * 75)
         print("[*] Initializing test client & warming recommendation engine...")
-        t0 = time.time()
+        t0 = time.perf_counter()
         cls.engine = initialize_engine()
         cls.client = app.test_client()
-        print(f"[OK] Test client ready in {time.time()-t0:.2f}s.\n")
+        _, _, cls.default_pred_ts = get_latest_snapshot()
+        # Mock time.time to be within fresh live window (60s after snapshot) for base suite tests
+        cls.time_patcher = patch("backend_service.time.time", return_value=cls.default_pred_ts + 60)
+        cls.mock_time = cls.time_patcher.start()
+        print(f"[OK] Test client ready in {time.perf_counter()-t0:.2f}s.\n")
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.time_patcher.stop()
 
     def test_01_health_endpoint(self):
         """Verify GET /api/health returns 200 and operational network stats."""
@@ -177,9 +186,9 @@ class TestBackendAPI(unittest.TestCase):
         response = self.client.post(
             "/api/journey/recommend",
             json={
-                "from": "Dhaula Kuan",
-                "to": "Patel Chowk Metro Station",
-                "reach_by": 4,  # Only 4 minutes for a 22-minute trip
+                "from": "Mahindra Park",
+                "to": "Azadpur",
+                "reach_by": 0.5,  # Physically infeasible (30s for >1.7km corridor)
             },
         )
         self.assertEqual(response.status_code, 200)
@@ -317,6 +326,114 @@ class TestBackendAPI(unittest.TestCase):
         print(f"       Destination: ({candidates[0]['destination']['latitude']}, {candidates[0]['destination']['longitude']})")
         print(f"       Vehicle: ({candidates[0]['vehicle_position']['latitude']}, {candidates[0]['vehicle_position']['longitude']})")
         print(f"       Route Path: {len(candidates[0]['route_path'])} stops from pickup to destination")
+
+    def test_12_live_request_uses_wall_clock_time(self):
+        """Verify that normal live request uses server wall-clock time, not snapshot max timestamp."""
+        print("[Test 12] Testing that live request uses wall-clock time...")
+        simulated_now = self.default_pred_ts + 75
+        self.mock_time.return_value = simulated_now
+        response = self.client.post(
+            "/api/journey/recommend",
+            json={"from": "Mahindra Park", "to": "Azadpur", "reach_by": 25},
+        )
+        self.assertEqual(response.status_code, 200)
+        data = response.get_json()
+        self.assertEqual(data["status"], "success")
+        self.assertEqual(data["query"]["telemetry_mode"], "live")
+        self.assertEqual(data["query"]["prediction_timestamp_unix"], simulated_now)
+        self.assertNotEqual(data["query"]["prediction_timestamp_unix"], self.default_pred_ts)
+        print(f"  [OK] Live request anchored to wall-clock time {simulated_now} (telemetry_mode=live).")
+
+    def test_13_explicit_replay_prediction_time(self):
+        """Verify that supplying prediction_time preserves replay mode with exact supplied timestamp."""
+        print("[Test 13] Testing that explicit prediction_time uses supplied timestamp...")
+        replay_ts = 1790772057
+        response = self.client.post(
+            "/api/journey/recommend",
+            json={
+                "from": "Mahindra Park",
+                "to": "Azadpur",
+                "reach_by": 25,
+                "prediction_time": replay_ts,
+            },
+        )
+        self.assertEqual(response.status_code, 200)
+        data = response.get_json()
+        self.assertEqual(data["status"], "success")
+        self.assertEqual(data["query"]["telemetry_mode"], "replay")
+        self.assertEqual(data["query"]["prediction_timestamp_unix"], replay_ts)
+        print(f"  [OK] Replay request used exact supplied timestamp {replay_ts} (telemetry_mode=replay).")
+
+    def test_14_stale_snapshot_detection(self):
+        """Verify that live request detects stale snapshot when age > 300s and returns 503 error."""
+        print("[Test 14] Testing stale snapshot detection (> 300s)...")
+        stale_now = self.default_pred_ts + 450  # 450s > 300s limit
+        self.mock_time.return_value = stale_now
+        response = self.client.post(
+            "/api/journey/recommend",
+            json={"from": "Mahindra Park", "to": "Azadpur", "reach_by": 25},
+        )
+        self.assertEqual(response.status_code, 503)
+        data = response.get_json()
+        self.assertEqual(data["status"], "error")
+        self.assertEqual(data["error_type"], "STALE_TELEMETRY_FEED")
+        self.assertEqual(data["telemetry_mode"], "live")
+        self.assertEqual(data["telemetry_age_seconds"], 450)
+        self.assertIn("exceeds 300s limit", data["message"])
+        print(f"  [OK] Stale feed rejected with 503 STALE_TELEMETRY_FEED (age: {data['telemetry_age_seconds']}s).")
+
+    def test_15_math_consistency_same_prediction_timestamp(self):
+        """Verify that existing recommendation calculations remain unchanged when using the same prediction timestamp."""
+        print("[Test 15] Testing recommendation math consistency when using same prediction timestamp...")
+        self.mock_time.return_value = self.default_pred_ts + 60
+        fixed_ts = self.default_pred_ts
+
+        # 1. Direct engine call
+        _, df_snap, _ = get_latest_snapshot()
+        direct_rec = self.engine.recommend_journey(
+            origin_stop="Mahindra Park",
+            destination_stop="Azadpur",
+            deadline_ts=fixed_ts + 25 * 60,
+            snapshot_df=df_snap,
+            prediction_ts=fixed_ts,
+        )
+
+        # 2. Endpoint call in replay mode with explicit prediction_time
+        response = self.client.post(
+            "/api/journey/recommend",
+            json={
+                "from": "Mahindra Park",
+                "to": "Azadpur",
+                "reach_by": 25,
+                "prediction_time": fixed_ts,
+            },
+        )
+        self.assertEqual(response.status_code, 200)
+        data = response.get_json()
+
+        # Compare core recommendations
+        direct_cand = direct_rec.get("recommended_option", {})
+        api_cand = data.get("recommended_candidate", {})
+
+        self.assertEqual(api_cand["vehicle_id"], direct_cand["vehicle_id"])
+        self.assertEqual(api_cand["route_id"], direct_cand["route_id"])
+        self.assertEqual(
+            api_cand["pickup"]["expected_wait_minutes"],
+            direct_cand["pickup_leg"]["expected_pickup_wait_minutes"],
+        )
+        self.assertEqual(
+            api_cand["destination"]["expected_arrival"],
+            direct_cand["destination_arrival"]["expected_arrival_formatted"],
+        )
+        self.assertEqual(
+            api_cand["deadline_probability"]["probability_on_time_pct"],
+            direct_cand["deadline_evaluation"]["probability_on_time_pct"],
+        )
+        self.assertEqual(
+            api_cand["deadline_probability"]["slack_minutes"],
+            direct_cand["deadline_evaluation"]["slack_minutes"],
+        )
+        print("  [OK] Math consistency verified: vehicle, arrival ETA, probability, and slack match direct engine output exactly.")
 
 
 if __name__ == "__main__":

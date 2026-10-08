@@ -52,6 +52,7 @@ from prototype_journey_recommendation import (
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 5000
 DATA_DIR = Path("data")
+MAX_LIVE_SNAPSHOT_AGE_S = 300  # 5 minutes maximum age for live telemetry feed
 
 app = Flask(__name__)
 START_TIME = time.time()
@@ -429,8 +430,41 @@ def recommend_journey_endpoint():
             "message": f"Realtime observation snapshot is currently unavailable: {str(e)}",
         }), 503
 
+    now_ts = int(time.time())
     custom_pred_ts = data.get("prediction_time") or data.get("current_time")
-    pred_ts = int(custom_pred_ts) if custom_pred_ts and str(custom_pred_ts).isdigit() else default_pred_ts
+    mode_param = (data.get("mode") or "").strip().lower()
+
+    # Determine execution mode (LIVE vs REPLAY):
+    # Replay mode if an explicit prediction timestamp is supplied or mode is explicitly 'replay'
+    if custom_pred_ts is not None and str(custom_pred_ts).isdigit():
+        is_replay = True
+        telemetry_mode = "replay"
+        pred_ts = int(custom_pred_ts)
+    elif mode_param == "replay":
+        is_replay = True
+        telemetry_mode = "replay"
+        pred_ts = default_pred_ts
+    else:
+        is_replay = False
+        telemetry_mode = "live"
+        pred_ts = now_ts
+
+    # Live telemetry freshness check (enforced strictly in LIVE mode)
+    if not is_replay:
+        snapshot_age_s = max(0, now_ts - default_pred_ts)
+        if snapshot_age_s > MAX_LIVE_SNAPSHOT_AGE_S:
+            return jsonify({
+                "status": "error",
+                "error_type": "STALE_TELEMETRY_FEED",
+                "message": (
+                    f"Live telemetry feed is delayed: latest snapshot is {snapshot_age_s}s old "
+                    f"(exceeds {MAX_LIVE_SNAPSHOT_AGE_S}s limit). Cannot serve live recommendations on stale data."
+                ),
+                "telemetry_mode": "live",
+                "telemetry_age_seconds": snapshot_age_s,
+                "latest_snapshot_ts": default_pred_ts,
+                "server_time_unix": now_ts,
+            }), 503
 
     # 3. Parse and Validate 'reach_by'
     reach_by_raw = data.get("reach_by") or data.get("deadline")
@@ -496,6 +530,7 @@ def recommend_journey_endpoint():
             "prediction_timestamp_unix": pred_ts,
             "prediction_time_formatted": format_unix_timestamp(pred_ts),
             "time_budget_minutes": round((deadline_ts - pred_ts) / 60.0, 1),
+            "telemetry_mode": telemetry_mode,
         },
         "recommended_candidate": recommended_option,
         "alternative_candidates": alt_options,
