@@ -52,7 +52,7 @@ from prototype_journey_recommendation import (
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 5000
 DATA_DIR = Path("data")
-MAX_LIVE_SNAPSHOT_AGE_S = 300  # 5 minutes maximum age for live telemetry feed
+MAX_LIVE_SNAPSHOT_AGE_S = 420  # 7 minutes maximum age for live telemetry feed
 
 app = Flask(__name__)
 START_TIME = time.time()

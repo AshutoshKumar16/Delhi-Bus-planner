@@ -365,9 +365,9 @@ class TestBackendAPI(unittest.TestCase):
         print(f"  [OK] Replay request used exact supplied timestamp {replay_ts} (telemetry_mode=replay).")
 
     def test_14_stale_snapshot_detection(self):
-        """Verify that live request detects stale snapshot when age > 300s and returns 503 error."""
-        print("[Test 14] Testing stale snapshot detection (> 300s)...")
-        stale_now = self.default_pred_ts + 450  # 450s > 300s limit
+        """Verify that live request detects stale snapshot when age > 420s and returns 503 error."""
+        print("[Test 14] Testing stale snapshot detection (> 420s)...")
+        stale_now = self.default_pred_ts + 450  # 450s > 420s limit
         self.mock_time.return_value = stale_now
         response = self.client.post(
             "/api/journey/recommend",
@@ -379,7 +379,7 @@ class TestBackendAPI(unittest.TestCase):
         self.assertEqual(data["error_type"], "STALE_TELEMETRY_FEED")
         self.assertEqual(data["telemetry_mode"], "live")
         self.assertEqual(data["telemetry_age_seconds"], 450)
-        self.assertIn("exceeds 300s limit", data["message"])
+        self.assertIn("exceeds 420s limit", data["message"])
         print(f"  [OK] Stale feed rejected with 503 STALE_TELEMETRY_FEED (age: {data['telemetry_age_seconds']}s).")
 
     def test_15_math_consistency_same_prediction_timestamp(self):
