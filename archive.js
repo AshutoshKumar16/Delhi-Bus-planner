@@ -195,7 +195,7 @@ function checkStorageGuards() {
       return false;
     }
   } catch (err) {
-    console.error(`Storage guard error: failed to verify drive free space: ${err.message}`);
+    console.error(`Storage guard error: failed to verify drive free space (${err.code || "UNKNOWN"}).`);
     return false;
   }
 
@@ -327,11 +327,11 @@ async function fetchFeedWithRetries(requestUrl) {
       if (attempt < MAX_RETRIES) {
         const delayMs = RETRY_BACKOFFS_MS[attempt];
         attempt++;
-        console.warn(`Network error: ${err.message}. Retrying in ${delayMs / 1000}s...`);
+        console.warn(`Network error (${err.code || "UNKNOWN"}). Retrying in ${delayMs / 1000}s...`);
         await interruptableSleep(delayMs);
         continue;
       } else {
-        console.error(`Network error: ${err.message}. All retries exhausted. Skipping poll.`);
+        console.error(`Network error (${err.code || "UNKNOWN"}). All retries exhausted. Skipping poll.`);
         return { skipped: true, statusCode: "ERROR", body: Buffer.alloc(0) };
       }
     }
@@ -597,6 +597,6 @@ async function main() {
 }
 
 main().catch((err) => {
-  console.error("Fatal error:", err.message);
+  console.error("Fatal error:", err.code || "unexpected error");
   process.exit(1);
 });
