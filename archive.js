@@ -240,7 +240,7 @@ function appendLogLine(entry) {
       ].join(",") + "\n";
     fs.appendFileSync(logFile, line, "utf8");
   } catch (err) {
-    console.error("Failed to append to log:", err.message);
+    console.error("Failed to append to log:", err.code || "UNKNOWN");
   }
 }
 
@@ -394,7 +394,7 @@ async function executePoll(pollIndex) {
   try {
     feed = GtfsRealtimeBindings.transit_realtime.FeedMessage.decode(responseBuffer);
   } catch (err) {
-    console.error("Decode error:", err.message);
+    console.error("Decode error:", err.code || "UNKNOWN");
     appendLogLine({
       time: fetchedAtIso,
       status: "DECODE_ERROR",
@@ -542,7 +542,7 @@ async function executePoll(pollIndex) {
       // Ignore cleanup error
     }
 
-    console.error("Write error:", err.message);
+    console.error("Write error:", err.code || "UNKNOWN");
 
     appendLogLine({
       time: fetchedAtIso,
