@@ -47,6 +47,22 @@ from prototype_journey_recommendation import (
     JourneyRecommendationEngine,
     format_unix_timestamp,
 )
+from stop_index import StopIndex
+from replay_snapshots import (
+    ArchiveDataUnavailableError,
+    ArchiveGapExceededError,
+    FuturePredictionTimeError,
+    InSampleReplayForbiddenError,
+    InvalidPredictionTimeError,
+    MissingPredictionTimeError,
+    ModelProvenancePolicy,
+    NoHistoricalSnapshotError,
+    ReplayError,
+    ReplayResolutionResult,
+    ReplaySnapshotResolver,
+    filter_snapshot_telemetry,
+    validate_prediction_ts,
+)
 
 # App Configuration
 DEFAULT_HOST = "127.0.0.1"
@@ -57,9 +73,72 @@ MAX_LIVE_SNAPSHOT_AGE_S = 420  # 7 minutes maximum age for live telemetry feed
 app = Flask(__name__)
 START_TIME = time.time()
 
-# Global Engine Instance (loaded once in memory)
+# Global Engine & Cache Instances (loaded once in memory)
 engine: Optional[JourneyRecommendationEngine] = None
 latest_snapshot_cache: Optional[Tuple[str, pd.DataFrame, int]] = None
+replay_resolver: Optional[ReplaySnapshotResolver] = None
+stop_index_instance: Optional[StopIndex] = None
+
+
+def load_model_provenance_policy(data_dir: Path = DATA_DIR) -> ModelProvenancePolicy:
+    """
+    Dynamically loads authoritative model provenance boundaries from disk artifacts:
+      1. training_cutoff_unix: from network_build_profile.json (summary.archive_days_list)
+      2. model_available_unix: strictly from route_segments_summary.json (metadata.created_at_iso)
+      3. production_activation_unix: None (unverified in repository metadata)
+
+    Operational Guarantees:
+      - Preserves verified training cutoff even if route_segments_summary.json is missing.
+      - If route_segments_summary.json is missing or malformed, model_available_unix is None.
+      - Never falls back to route_reconstruction_summary.json for segment availability.
+      - Never injects diagnostic defaults into production.
+    """
+    training_cutoff_unix: Optional[int] = None
+    model_available_unix: Optional[int] = None
+
+    # 1. Training Cutoff: end of last archive day processed in network_build_profile.json
+    profile_path = data_dir / "network_build_profile.json"
+    if profile_path.is_file():
+        try:
+            with open(profile_path, "r", encoding="utf-8") as f:
+                prof_data = json.load(f)
+            days = prof_data.get("summary", {}).get("archive_days_list") or prof_data.get("archive_days_list")
+            if days and isinstance(days, list):
+                valid_days = [str(d).strip() for d in days if re.match(r"^\d{4}-\d{2}-\d{2}$", str(d).strip())]
+                if valid_days:
+                    last_day = max(valid_days)
+                    dt_last = datetime.datetime.strptime(last_day, "%Y-%m-%d").replace(tzinfo=datetime.timezone.utc)
+                    training_cutoff_unix = int((dt_last + datetime.timedelta(days=1)).timestamp())
+        except Exception:
+            training_cutoff_unix = None
+
+    # 2. Model Availability: strictly from route_segments_summary.json
+    summary_path = data_dir / "route_segments_summary.json"
+    if summary_path.is_file():
+        try:
+            with open(summary_path, "r", encoding="utf-8") as f:
+                seg_summary = json.load(f)
+            iso_str = seg_summary.get("metadata", {}).get("created_at_iso")
+            if iso_str and isinstance(iso_str, str):
+                dt_created = datetime.datetime.fromisoformat(iso_str.replace("Z", "+00:00"))
+                model_available_unix = int(dt_created.timestamp())
+        except Exception:
+            model_available_unix = None
+
+    return ModelProvenancePolicy(
+        training_cutoff_unix=training_cutoff_unix,
+        model_available_unix=model_available_unix,
+        production_activation_unix=None,
+    )
+
+
+def get_replay_resolver(data_dir: Path = DATA_DIR) -> ReplaySnapshotResolver:
+    """Returns the singleton ReplaySnapshotResolver initialized with dynamic artifact provenance."""
+    global replay_resolver
+    if replay_resolver is None:
+        policy = load_model_provenance_policy(data_dir)
+        replay_resolver = ReplaySnapshotResolver(archive_dir=data_dir, provenance_policy=policy)
+    return replay_resolver
 
 
 def get_latest_snapshot() -> Tuple[str, pd.DataFrame, int]:
@@ -102,6 +181,17 @@ def initialize_engine(
         engine = JourneyRecommendationEngine(routes_path, segments_path)
         print(f"[OK] Engine initialized successfully in {time.time()-t0:.2f}s.")
     return engine
+
+
+def initialize_stop_index(
+    routes_path: Path = DEFAULT_ROUTES_PATH, segments_path: Path = DEFAULT_SEGMENTS_PATH
+) -> StopIndex:
+    """Initializes and returns the singleton StopIndex instance using the recommendation engine."""
+    global stop_index_instance
+    if stop_index_instance is None:
+        eng = initialize_engine(routes_path, segments_path)
+        stop_index_instance = StopIndex(eng)
+    return stop_index_instance
 
 
 def parse_reach_by(
@@ -162,8 +252,8 @@ def parse_reach_by(
                 dt = datetime.datetime.strptime(iso_str, fmt)
                 # If timezone naive, assume Indian Standard Time (UTC+05:30)
                 if dt.tzinfo is None:
-                    # IST offset is +19800 seconds
-                    return int(dt.timestamp() - 19800 + time.timezone), None
+                    ist_tz = datetime.timezone(datetime.timedelta(hours=5, minutes=30))
+                    dt = dt.replace(tzinfo=ist_tz)
                 return int(dt.timestamp()), None
             except ValueError:
                 continue
@@ -197,8 +287,18 @@ def sanitize_candidate_for_api(
     de = c.get("deadline_evaluation", {})
     ev = c.get("evidence", {})
 
-    age_s = tel.get("telemetry_age_seconds", 0)
-    freshness_status = "FRESH" if age_s <= 300 else ("MODERATE" if age_s <= 900 else "STALE")
+    age_s = tel.get("telemetry_age_seconds")
+    if age_s is None or not isinstance(age_s, (int, float)):
+        freshness_status = "UNKNOWN"
+        age_s = 0
+    elif age_s < 0:
+        freshness_status = "INVALID_FUTURE_TIMESTAMP"
+    elif age_s <= 300:
+        freshness_status = "FRESH"
+    elif age_s <= 900:
+        freshness_status = "MODERATE"
+    else:
+        freshness_status = "STALE"
 
     # 1. Lookup route stop coordinates for the candidate's own direction
     rid = str(c.get("route_id", ""))
@@ -346,12 +446,20 @@ def add_cors_headers(response):
     return response
 
 
+# Stop Discovery Configuration
+DEFAULT_SEARCH_LIMIT = 10
+MAX_SEARCH_LIMIT = 50
+DEFAULT_DEST_LIMIT = 50
+MAX_DEST_LIMIT = 100
+
+
 @app.route("/api/health", methods=["GET"])
 def health_check():
     """
     Health check endpoint: returns engine readiness and network dimensions.
     """
     eng = initialize_engine()
+    stop_idx = initialize_stop_index()
     uptime_s = round(time.time() - START_TIME, 1)
 
     return jsonify({
@@ -363,9 +471,126 @@ def health_check():
             "reconstructed_routes_indexed": len(eng.routes),
             "route_segments_indexed": sum(len(d) for d in eng.segments_by_dir.values()),
             "distinct_stop_keys_indexed": len(eng.stop_to_directions),
+            "indexed_stop_ids": stop_idx.stats()["indexed_stop_ids"],
+            "indexed_stop_names": stop_idx.stats()["indexed_name_keys"],
         },
         "timestamp_unix": int(time.time()),
         "timestamp_formatted": format_unix_timestamp(int(time.time())),
+    }), 200
+
+
+@app.route("/api/stops/search", methods=["GET", "OPTIONS"])
+def search_stops_endpoint():
+    """
+    GET /api/stops/search?q=<query>&limit=<limit>
+
+    Autocomplete / lookup for Delhi bus stops by physical ID, exact name,
+    prefix, or substring. Deduplicated by physical stop_id.
+    """
+    if request.method == "OPTIONS":
+        return "", 204
+
+    q = request.args.get("q")
+    if q is None:
+        return jsonify({
+            "status": "error",
+            "error_type": "MISSING_QUERY",
+            "message": "Query parameter 'q' is required.",
+        }), 400
+
+    limit_raw = request.args.get("limit")
+    if limit_raw is not None:
+        try:
+            limit = int(limit_raw)
+            if limit <= 0:
+                return jsonify({
+                    "status": "error",
+                    "error_type": "INVALID_LIMIT",
+                    "message": "Parameter 'limit' must be a positive integer.",
+                }), 400
+            limit = min(limit, MAX_SEARCH_LIMIT)
+        except (ValueError, TypeError):
+            return jsonify({
+                "status": "error",
+                "error_type": "INVALID_LIMIT",
+                "message": "Parameter 'limit' must be an integer.",
+            }), 400
+    else:
+        limit = DEFAULT_SEARCH_LIMIT
+
+    stop_idx = initialize_stop_index()
+    results = stop_idx.search_stops(q, limit=limit)
+
+    return jsonify({
+        "status": "success",
+        "query": q,
+        "results_count": len(results),
+        "limit": limit,
+        "stops": [s.to_dict() for s in results],
+    }), 200
+
+
+@app.route("/api/stops/destinations", methods=["GET", "OPTIONS"])
+def reachable_destinations_endpoint():
+    """
+    GET /api/stops/destinations?origin_id=<stop_id>&limit=<limit>
+
+    Returns downstream bus stops reachable from origin_id via the
+    reconstructed route network in forward sequence.
+    Structural connectivity only — NOT live bus availability.
+    """
+    if request.method == "OPTIONS":
+        return "", 204
+
+    origin_id = request.args.get("origin_id") or request.args.get("origin_stop_id")
+    if not origin_id or not origin_id.strip():
+        return jsonify({
+            "status": "error",
+            "error_type": "MISSING_ORIGIN_ID",
+            "message": "Query parameter 'origin_id' (or 'origin_stop_id') is required.",
+        }), 400
+
+    origin_id = origin_id.strip()
+
+    limit_raw = request.args.get("limit")
+    if limit_raw is not None:
+        try:
+            limit = int(limit_raw)
+            if limit <= 0:
+                return jsonify({
+                    "status": "error",
+                    "error_type": "INVALID_LIMIT",
+                    "message": "Parameter 'limit' must be a positive integer.",
+                }), 400
+            limit = min(limit, MAX_DEST_LIMIT)
+        except (ValueError, TypeError):
+            return jsonify({
+                "status": "error",
+                "error_type": "INVALID_LIMIT",
+                "message": "Parameter 'limit' must be an integer.",
+            }), 400
+    else:
+        limit = DEFAULT_DEST_LIMIT
+
+    stop_idx = initialize_stop_index()
+    origin_stop = stop_idx.get_stop_by_id(origin_id)
+    if origin_stop is None:
+        return jsonify({
+            "status": "error",
+            "error_type": "STOP_NOT_FOUND",
+            "message": f"Stop ID '{origin_id}' was not found in the reconstructed route network.",
+        }), 404
+
+    dests = stop_idx.get_reachable_destinations(origin_id, limit=limit)
+
+    return jsonify({
+        "status": "success",
+        "origin": origin_stop.to_dict(),
+        "connectivity_type": "structural_network",
+        "disclosure": "Destination suggestions represent structural route-network connectivity only, not live bus availability or deadline feasibility.",
+        "results_count": len(dests),
+        "limit": limit,
+        "destinations": [d.to_dict() for d in dests],
     }), 200
 
 
@@ -420,37 +645,63 @@ def recommend_journey_endpoint():
             "message": "Origin and destination stops cannot be identical.",
         }), 400
 
-    # 2. Resolve Snapshot & Prediction Timestamp
-    try:
-        snap_file, df_snap, default_pred_ts = get_latest_snapshot()
-    except Exception as e:
+    # 2. Mode Validation Precedence
+    # Step 1: Reject unsupported mode values first
+    raw_mode = data.get("mode")
+    mode_str: Optional[str] = None
+    if raw_mode is not None:
+        if not isinstance(raw_mode, str) or raw_mode.strip().lower() not in ("live", "replay"):
+            return jsonify({
+                "status": "error",
+                "error_type": "INVALID_MODE",
+                "message": f"Unsupported mode: '{raw_mode}'. Mode must be 'live' or 'replay'.",
+                "supported_modes": ["live", "replay"],
+            }), 400
+        mode_str = raw_mode.strip().lower()
+
+    # Step 2: Apply backward-compatible mode resolution
+    raw_pred_time = data.get("prediction_time") if "prediction_time" in data else data.get("current_time")
+    if mode_str is not None:
+        resolved_mode = mode_str
+    elif raw_pred_time is not None:
+        resolved_mode = "replay"  # Inferred for existing clients and tests
+    else:
+        resolved_mode = "live"    # Default live behavior
+
+    # Step 3: Reject mode="live" combined with prediction_time
+    if resolved_mode == "live" and raw_pred_time is not None:
         return jsonify({
             "status": "error",
-            "error_type": "DATASET_UNAVAILABLE",
-            "message": f"Realtime observation snapshot is currently unavailable: {str(e)}",
-        }), 503
+            "error_type": "CONFLICTING_MODE",
+            "message": "Parameter 'prediction_time' cannot be specified when mode is 'live'.",
+        }), 400
 
+    # Step 4: Reject mode="replay" without prediction_time
+    if resolved_mode == "replay" and raw_pred_time is None:
+        return jsonify({
+            "status": "error",
+            "error_type": "MISSING_PREDICTION_TIME",
+            "message": "Field 'prediction_time' is required for replay mode.",
+        }), 400
+
+    # 3. Resolve Snapshot & Telemetry Feed
     now_ts = int(time.time())
-    custom_pred_ts = data.get("prediction_time") or data.get("current_time")
-    mode_param = (data.get("mode") or "").strip().lower()
+    replay_metadata: Optional[Dict[str, Any]] = None
 
-    # Determine execution mode (LIVE vs REPLAY):
-    # Replay mode if an explicit prediction timestamp is supplied or mode is explicitly 'replay'
-    if custom_pred_ts is not None and str(custom_pred_ts).isdigit():
-        is_replay = True
-        telemetry_mode = "replay"
-        pred_ts = int(custom_pred_ts)
-    elif mode_param == "replay":
-        is_replay = True
-        telemetry_mode = "replay"
-        pred_ts = default_pred_ts
-    else:
-        is_replay = False
-        telemetry_mode = "live"
+    if resolved_mode == "live":
+        # Live Snapshot Resolution
+        try:
+            snap_file, df_snap, default_pred_ts = get_latest_snapshot()
+        except Exception as e:
+            return jsonify({
+                "status": "error",
+                "error_type": "DATASET_UNAVAILABLE",
+                "message": f"Realtime observation snapshot is currently unavailable: {str(e)}",
+            }), 503
+
         pred_ts = now_ts
+        telemetry_mode = "live"
 
-    # Live telemetry freshness check (enforced strictly in LIVE mode)
-    if not is_replay:
         snapshot_age_s = max(0, now_ts - default_pred_ts)
         if snapshot_age_s > MAX_LIVE_SNAPSHOT_AGE_S:
             return jsonify({
@@ -466,7 +717,95 @@ def recommend_journey_endpoint():
                 "server_time_unix": now_ts,
             }), 503
 
-    # 3. Parse and Validate 'reach_by'
+        # Defensive Live Telemetry Filtering:
+        # Prune missing, non-numeric, or future vehicle observations (vehicle_ts_unix > now_ts)
+        df_snap, _ = filter_snapshot_telemetry(df_snap, pred_ts)
+
+    else:
+        # Replay Snapshot Resolution
+        telemetry_mode = "replay"
+        try:
+            pred_ts = validate_prediction_ts(raw_pred_time, now_ts=now_ts)
+        except MissingPredictionTimeError as e:
+            return jsonify({
+                "status": "error",
+                "error_type": "MISSING_PREDICTION_TIME",
+                "message": str(e),
+            }), 400
+        except InvalidPredictionTimeError as e:
+            return jsonify({
+                "status": "error",
+                "error_type": "INVALID_PREDICTION_TIME",
+                "message": str(e),
+            }), 400
+        except FuturePredictionTimeError as e:
+            return jsonify({
+                "status": "error",
+                "error_type": "FUTURE_PREDICTION_TIME",
+                "message": str(e),
+                "prediction_timestamp_unix": int(raw_pred_time) if str(raw_pred_time).isdigit() else raw_pred_time,
+                "server_time_unix": now_ts,
+            }), 400
+
+        server_diagnostic_override = bool(app.config.get("ALLOW_IN_SAMPLE_REPLAY", False))
+        resolver = get_replay_resolver()
+        try:
+            res: ReplayResolutionResult = resolver.resolve_replay_snapshot(
+                pred_ts, allow_in_sample=server_diagnostic_override
+            )
+        except InSampleReplayForbiddenError as e:
+            return jsonify({
+                "status": "error",
+                "error_type": "IN_SAMPLE_REPLAY_FORBIDDEN",
+                "message": (
+                    "Historical replay is not supported for timestamps within the model training corpus. "
+                    "Please select a prediction time after the training cutoff."
+                ),
+                "prediction_timestamp_unix": pred_ts,
+            }), 403
+        except NoHistoricalSnapshotError as e:
+            return jsonify({
+                "status": "error",
+                "error_type": "NO_HISTORICAL_SNAPSHOT",
+                "message": str(e),
+                "prediction_timestamp_unix": pred_ts,
+                "commit_margin_seconds": resolver.commit_margin_s,
+            }), 404
+        except ArchiveGapExceededError as e:
+            return jsonify({
+                "status": "error",
+                "error_type": "ARCHIVE_GAP_EXCEEDED",
+                "message": str(e),
+                "prediction_ts": e.prediction_ts,
+                "gap_seconds": e.gap_seconds,
+                "max_gap_seconds": e.max_gap_seconds,
+                "newest_snapshot_poll_start": e.newest_snapshot_poll_start,
+            }), 503
+        except ArchiveDataUnavailableError as e:
+            return jsonify({
+                "status": "error",
+                "error_type": "ARCHIVE_DATA_UNAVAILABLE",
+                "message": str(e),
+                "candidates_evaluated": resolver.max_fallback_candidates,
+                "max_snapshot_age_seconds": resolver.max_snapshot_age_s,
+            }), 503
+        except ReplayError as e:
+            return jsonify({
+                "status": "error",
+                "error_type": "REPLAY_ERROR",
+                "message": str(e),
+            }), 500
+
+        df_snap = res.df
+        replay_metadata = {
+            "snapshot_path": res.snapshot_path,
+            "snapshot_age_seconds": res.snapshot_age_seconds,
+            "candidates_evaluated": res.candidates_evaluated,
+            "provenance": res.provenance,
+            "telemetry_diagnostics": res.telemetry_diagnostics,
+        }
+
+    # 4. Parse and Validate 'reach_by'
     reach_by_raw = data.get("reach_by") or data.get("deadline")
     deadline_ts, err_msg = parse_reach_by(reach_by_raw, pred_ts)
     if err_msg:
@@ -476,7 +815,7 @@ def recommend_journey_endpoint():
             "message": err_msg,
         }), 400
 
-    # 4. Execute Engine Recommendation
+    # 5. Execute Engine Recommendation
     eng = initialize_engine()
     t_start = time.time()
     try:
@@ -496,7 +835,7 @@ def recommend_journey_endpoint():
 
     exec_time_ms = round((time.time() - t_start) * 1000.0, 2)
 
-    # 5. Sanitize Output for Web API
+    # 6. Sanitize Output for Web API
     system_state = rec.get("system_state", "UNKNOWN")
     ro_raw = rec.get("recommended_option")
     recommended_option = sanitize_candidate_for_api(ro_raw, eng) if ro_raw else None
@@ -518,20 +857,25 @@ def recommend_journey_endpoint():
         comparison["fastest_eta_baseline_choice"] = comp_raw["fastest_eta_baseline_choice"]
 
     # Final Web Response Payload
+    query_payload: Dict[str, Any] = {
+        "origin_stop": from_stop,
+        "destination_stop": to_stop,
+        "reach_by_unix": deadline_ts,
+        "reach_by_formatted": format_unix_timestamp(deadline_ts),
+        "prediction_timestamp_unix": pred_ts,
+        "prediction_time_formatted": format_unix_timestamp(pred_ts),
+        "time_budget_minutes": round((deadline_ts - pred_ts) / 60.0, 1),
+        "telemetry_mode": telemetry_mode,
+    }
+    if replay_metadata is not None:
+        query_payload["snapshot_path"] = replay_metadata["snapshot_path"]
+        query_payload["snapshot_age_seconds"] = replay_metadata["snapshot_age_seconds"]
+
     response_payload = {
         "status": "success",
         "system_state": system_state,
         "message": rec.get("message"),
-        "query": {
-            "origin_stop": from_stop,
-            "destination_stop": to_stop,
-            "reach_by_unix": deadline_ts,
-            "reach_by_formatted": format_unix_timestamp(deadline_ts),
-            "prediction_timestamp_unix": pred_ts,
-            "prediction_time_formatted": format_unix_timestamp(pred_ts),
-            "time_budget_minutes": round((deadline_ts - pred_ts) / 60.0, 1),
-            "telemetry_mode": telemetry_mode,
-        },
+        "query": query_payload,
         "recommended_candidate": recommended_option,
         "alternative_candidates": alt_options,
         "unreliable_candidates": unrel_options,
@@ -543,6 +887,9 @@ def recommend_journey_endpoint():
             "execution_time_ms": exec_time_ms,
         },
     }
+    if replay_metadata is not None:
+        response_payload["provenance"] = replay_metadata["provenance"]
+        response_payload["telemetry_diagnostics"] = replay_metadata["telemetry_diagnostics"]
 
     return jsonify(response_payload), 200
 
@@ -557,11 +904,14 @@ def main():
 
     args = parser.parse_args()
 
-    # Preload engine models
+    # Preload engine models & stop index
     initialize_engine()
+    initialize_stop_index()
 
     print(f"\n[OK] Delhi Bus Backend API Service listening on http://{args.host}:{args.port}")
     print(f"  Health Check:           GET  http://{args.host}:{args.port}/api/health")
+    print(f"  Stop Autocomplete:      GET  http://{args.host}:{args.port}/api/stops/search")
+    print(f"  Reachable Destinations: GET  http://{args.host}:{args.port}/api/stops/destinations")
     print(f"  Journey Recommendation: POST http://{args.host}:{args.port}/api/journey/recommend")
     app.run(host=args.host, port=args.port, debug=False)
 

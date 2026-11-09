@@ -1,15 +1,19 @@
 import React, { useEffect, useMemo, useState } from 'react';
-import { fetchHealth, fetchJourneyRecommendation } from './api';
+import { fetchHealth, fetchJourneyRecommendation, type ApiError } from './api';
 import type {
   CandidateBus,
   HealthCheckResponse,
+  JourneyRecommendRequest,
   JourneyRecommendResponse,
 } from './types';
 import {
   combineDateAndTimeToUnix,
   getDefaultReachByTime,
   getHumanDeadlinePreview,
+  parseDateTimeToUnix,
   toLocalDateString,
+  VERIFIED_REPLAY_DATE,
+  VERIFIED_REPLAY_TIME,
 } from './timeUtils';
 import { useMediaQuery } from './hooks/useMediaQuery';
 import { TopBar } from './components/TopBar';
@@ -20,22 +24,124 @@ import { AlternativesList } from './components/AlternativesList';
 import { MapPanel } from './components/MapPanel';
 import './App.css';
 
+interface ErrorState {
+  title: string;
+  message: string;
+  errorType?: string;
+}
+
+/**
+ * Calculates a default arrival deadline 30 minutes after an observation timestamp,
+ * handling hour, midnight, and calendar rollovers cleanly with strict validation.
+ * Malformed or out-of-range inputs are never silently normalized or converted to 00:00.
+ */
+function calculateReplayDeadline(
+  dateStr: string,
+  timeStr: string
+): { reachByDate: string; reachByTime: string } {
+  const trimmedDate = (dateStr || '').trim();
+  const trimmedTime = (timeStr || '').trim();
+
+  // 1. Strict YYYY-MM-DD date validation
+  const dateMatch = trimmedDate.match(/^(\d{4})-(\d{2})-(\d{2})$/);
+  if (!dateMatch) {
+    return { reachByDate: dateStr, reachByTime: timeStr };
+  }
+
+  const year = parseInt(dateMatch[1], 10);
+  const month = parseInt(dateMatch[2], 10) - 1;
+  const day = parseInt(dateMatch[3], 10);
+
+  // UTC component round-trip check to prevent silent date rollover (e.g. Feb 31 -> Mar 3)
+  const checkUtcMs = Date.UTC(year, month, day, 0, 0, 0, 0);
+  if (isNaN(checkUtcMs)) {
+    return { reachByDate: dateStr, reachByTime: timeStr };
+  }
+  const checkDate = new Date(checkUtcMs);
+  if (
+    checkDate.getUTCFullYear() !== year ||
+    checkDate.getUTCMonth() !== month ||
+    checkDate.getUTCDate() !== day
+  ) {
+    return { reachByDate: dateStr, reachByTime: timeStr };
+  }
+
+  // 2. Strict time validation anchored with ^ and $
+  const timeRegex = /^(\d{1,2}):(\d{2})(?::(\d{2}))?\s*([aApP][mM])?$/;
+  const match = trimmedTime.match(timeRegex);
+  if (!match) {
+    return { reachByDate: dateStr, reachByTime: timeStr };
+  }
+
+  let hours = parseInt(match[1], 10);
+  const minutes = parseInt(match[2], 10);
+  const seconds = match[3] !== undefined ? parseInt(match[3], 10) : 0;
+  const ampm = match[4]?.toUpperCase();
+
+  // Validate minute and second ranges (0–59)
+  if (minutes < 0 || minutes > 59 || seconds < 0 || seconds > 59) {
+    return { reachByDate: dateStr, reachByTime: timeStr };
+  }
+
+  // Validate hour ranges (0–23 for 24h, 1–12 for 12h)
+  if (ampm) {
+    if (hours < 1 || hours > 12) {
+      return { reachByDate: dateStr, reachByTime: timeStr };
+    }
+    if (ampm === 'PM' && hours < 12) {
+      hours += 12;
+    } else if (ampm === 'AM' && hours === 12) {
+      hours = 0;
+    }
+  } else {
+    if (hours < 0 || hours > 23) {
+      return { reachByDate: dateStr, reachByTime: timeStr };
+    }
+  }
+
+  // 3. Valid input: advance by 30 minutes in UTC
+  const futureMs = Date.UTC(year, month, day, hours, minutes + 30, seconds, 0);
+  const d = new Date(futureMs);
+
+  const nextYear = d.getUTCFullYear();
+  const nextMonth = String(d.getUTCMonth() + 1).padStart(2, '0');
+  const nextDay = String(d.getUTCDate()).padStart(2, '0');
+  const nextHours = String(d.getUTCHours()).padStart(2, '0');
+  const nextMinutes = String(d.getUTCMinutes()).padStart(2, '0');
+  const nextSeconds = String(d.getUTCSeconds()).padStart(2, '0');
+
+  const timeOut = match[3] !== undefined
+    ? `${nextHours}:${nextMinutes}:${nextSeconds}`
+    : `${nextHours}:${nextMinutes}`;
+
+  return {
+    reachByDate: `${nextYear}-${nextMonth}-${nextDay}`,
+    reachByTime: timeOut,
+  };
+}
+
 export const App: React.FC = () => {
   // Screen size check: desktop is >= 1024px
   const isDesktop = useMediaQuery('(min-width: 1024px)');
 
   // Form State
   const [fromStop, setFromStop] = useState<string>('Mahindra Park');
+  const [fromStopId, setFromStopId] = useState<string | null>(null);
   const [toStop, setToStop] = useState<string>('Azadpur');
+  const [toStopId, setToStopId] = useState<string | null>(null);
   const [reachByDate, setReachByDate] = useState<string>(() => toLocalDateString());
   const [reachByTime, setReachByTime] = useState<string>(() => getDefaultReachByTime());
 
   // Telemetry Mode ('live' | 'replay')
   const [telemetryMode, setTelemetryMode] = useState<'live' | 'replay'>('live');
 
+  // Replay Observation Time State (defaults to verified out-of-sample slice)
+  const [replayDate, setReplayDate] = useState<string>(VERIFIED_REPLAY_DATE);
+  const [replayTime, setReplayTime] = useState<string>(VERIFIED_REPLAY_TIME);
+
   // Async States
   const [loading, setLoading] = useState<boolean>(false);
-  const [error, setError] = useState<string | null>(null);
+  const [error, setError] = useState<ErrorState | null>(null);
   const [result, setResult] = useState<JourneyRecommendResponse | null>(null);
 
   // Selected candidate vehicle ID override (when user clicks an alternative)
@@ -64,18 +170,110 @@ export const App: React.FC = () => {
       .catch((err) => setHealthError(err.message));
   }, []);
 
+  const handleModeChange = (mode: 'live' | 'replay') => {
+    setTelemetryMode(mode);
+    setError(null);
+    setSelectedIdOverride(null);
+    if (mode === 'replay') {
+      const { reachByDate: syncDate, reachByTime: syncTime } = calculateReplayDeadline(
+        replayDate,
+        replayTime
+      );
+      setReachByDate(syncDate);
+      setReachByTime(syncTime);
+    } else {
+      if (reachByDate < toLocalDateString()) {
+        setReachByDate(toLocalDateString());
+        setReachByTime(getDefaultReachByTime());
+      }
+    }
+  };
+
+  const handleApplyReplayPreset = () => {
+    setReplayDate(VERIFIED_REPLAY_DATE);
+    setReplayTime(VERIFIED_REPLAY_TIME);
+    const { reachByDate: syncDate, reachByTime: syncTime } = calculateReplayDeadline(
+      VERIFIED_REPLAY_DATE,
+      VERIFIED_REPLAY_TIME
+    );
+    setReachByDate(syncDate);
+    setReachByTime(syncTime);
+    setError(null);
+  };
+
   const handleSearch = async (e?: React.FormEvent) => {
     if (e) e.preventDefault();
 
     if (!fromStop.trim() || !toStop.trim()) {
-      setError('Please enter both an origin stop and a destination stop.');
+      setError({
+        title: 'Invalid Journey Stops',
+        message: 'Please enter both an origin stop and a destination stop.',
+        errorType: 'MISSING_STOPS',
+      });
       return;
     }
 
-    const parsed = combineDateAndTimeToUnix(reachByDate, reachByTime, new Date());
-    if (parsed.error || !parsed.unixSeconds) {
-      setError(parsed.error || 'Please provide a valid reach-by date and time.');
-      return;
+    let requestParams: JourneyRecommendRequest;
+
+    if (telemetryMode === 'replay') {
+      const parsedPred = parseDateTimeToUnix(replayDate, replayTime);
+      if (parsedPred.error || parsedPred.unixSeconds == null || !parsedPred.targetDate) {
+        setError({
+          title: 'Invalid Replay Timestamp',
+          message: parsedPred.error || 'Please provide a valid historical observation date and time.',
+          errorType: 'INVALID_PREDICTION_TIME',
+        });
+        return;
+      }
+
+      const parsedDeadline = combineDateAndTimeToUnix(
+        reachByDate,
+        reachByTime,
+        parsedPred.targetDate,
+        'historical observation time'
+      );
+      if (parsedDeadline.error || parsedDeadline.unixSeconds == null) {
+        setError({
+          title: 'Invalid Arrival Deadline',
+          message: parsedDeadline.error || 'Please provide a valid reach-by date and time after the observation time.',
+          errorType: 'INVALID_DEADLINE',
+        });
+        return;
+      }
+
+      if (parsedDeadline.unixSeconds <= parsedPred.unixSeconds) {
+        setError({
+          title: 'Invalid Arrival Deadline',
+          message: 'The reach-by deadline must be strictly after the historical observation time.',
+          errorType: 'INVALID_DEADLINE',
+        });
+        return;
+      }
+
+      requestParams = {
+        from: fromStopId || fromStop.trim(),
+        to: toStopId || toStop.trim(),
+        reach_by: parsedDeadline.unixSeconds,
+        mode: 'replay',
+        prediction_time: parsedPred.unixSeconds,
+      };
+    } else {
+      const parsed = combineDateAndTimeToUnix(reachByDate, reachByTime, new Date());
+      if (parsed.error || !parsed.unixSeconds) {
+        setError({
+          title: 'Invalid Arrival Deadline',
+          message: parsed.error || 'Please provide a valid future reach-by date and time.',
+          errorType: 'INVALID_DEADLINE',
+        });
+        return;
+      }
+
+      requestParams = {
+        from: fromStopId || fromStop.trim(),
+        to: toStopId || toStop.trim(),
+        reach_by: parsed.unixSeconds,
+        mode: 'live',
+      };
     }
 
     setLoading(true);
@@ -84,24 +282,72 @@ export const App: React.FC = () => {
     setSelectedIdOverride(null);
 
     try {
-      const response = await fetchJourneyRecommendation({
-        from: fromStop.trim(),
-        to: toStop.trim(),
-        reach_by: parsed.unixSeconds,
-      });
+      const response = await fetchJourneyRecommendation(requestParams);
       setResult(response);
     } catch (err: unknown) {
-      const msg = err instanceof Error ? err.message : 'Unable to plan journey. Please verify your connection.';
-      setError(msg);
+      const apiErr = err as ApiError;
+      const errType = apiErr?.errorType;
+      const rawMsg =
+        apiErr?.message ||
+        (err instanceof Error
+          ? err.message
+          : 'Unable to plan journey. Please verify your connection.');
+
+      let title = 'Unable to plan journey';
+      switch (errType) {
+        case 'MISSING_PREDICTION_TIME':
+        case 'INVALID_PREDICTION_TIME':
+          title = 'Invalid Replay Timestamp';
+          break;
+        case 'FUTURE_PREDICTION_TIME':
+          title = 'Future Timestamp Rejected';
+          break;
+        case 'IN_SAMPLE_REPLAY_FORBIDDEN':
+          title = 'In-Sample Historical Replay Restricted';
+          break;
+        case 'NO_HISTORICAL_SNAPSHOT':
+          title = 'No Historical Snapshot Found';
+          break;
+        case 'ARCHIVE_GAP_EXCEEDED':
+          title = 'Archive Gap Exceeded';
+          break;
+        case 'ARCHIVE_DATA_UNAVAILABLE':
+          title = 'Archive Telemetry Unavailable';
+          break;
+        case 'STALE_TELEMETRY_FEED':
+          title = 'Stale Live Telemetry Feed';
+          break;
+        case 'DATASET_UNAVAILABLE':
+          title = 'Telemetry Feed Unavailable';
+          break;
+        case 'INVALID_DEADLINE':
+          title = 'Invalid Arrival Deadline';
+          break;
+        case 'NO_DIRECT_ROUTE':
+          title = 'No Direct Route Found';
+          break;
+        case 'IDENTICAL_STOPS':
+          title = 'Invalid Journey Stops';
+          break;
+      }
+
+      setError({
+        title,
+        message: rawMsg,
+        errorType: errType,
+      });
     } finally {
       setLoading(false);
     }
   };
 
   const handleSwapStops = () => {
-    const temp = fromStop;
+    const tempText = fromStop;
+    const tempId = fromStopId;
     setFromStop(toStop);
-    setToStop(temp);
+    setFromStopId(toStopId);
+    setToStop(tempText);
+    setToStopId(tempId);
     setResult(null);
     setError(null);
     setSelectedIdOverride(null);
@@ -178,7 +424,7 @@ export const App: React.FC = () => {
       {/* Slim Top Bar */}
       <TopBar
         telemetryMode={telemetryMode}
-        onModeChange={setTelemetryMode}
+        onModeChange={handleModeChange}
         health={health}
         healthError={healthError}
       />
@@ -192,8 +438,12 @@ export const App: React.FC = () => {
             <PlannerForm
               fromStop={fromStop}
               setFromStop={setFromStop}
+              fromStopId={fromStopId}
+              setFromStopId={setFromStopId}
               toStop={toStop}
               setToStop={setToStop}
+              toStopId={toStopId}
+              setToStopId={setToStopId}
               reachByDate={reachByDate}
               setReachByDate={setReachByDate}
               reachByTime={reachByTime}
@@ -203,7 +453,14 @@ export const App: React.FC = () => {
               onSearch={handleSearch}
               onSwap={handleSwapStops}
               telemetryMode={telemetryMode}
-              replayTimestampContext={result?.query.prediction_time_formatted}
+              replayDate={replayDate}
+              setReplayDate={setReplayDate}
+              replayTime={replayTime}
+              setReplayTime={setReplayTime}
+              onApplyReplayPreset={handleApplyReplayPreset}
+              resolvedSnapshotPath={result?.query?.snapshot_path}
+              resolvedSnapshotAgeSeconds={result?.query?.snapshot_age_seconds}
+              replayTimestampContext={result?.query?.prediction_time_formatted}
             />
 
             {/* Error Notification */}
@@ -217,8 +474,13 @@ export const App: React.FC = () => {
                   </svg>
                 </div>
                 <div className="notification-text">
-                  <strong>Unable to plan journey</strong>
-                  <p>{error}</p>
+                  <strong>{error.title}</strong>
+                  <p>{error.message}</p>
+                  {error.errorType && (
+                    <span style={{ fontSize: '0.72rem', opacity: 0.85, marginTop: '2px', display: 'block' }}>
+                      Code: {error.errorType}
+                    </span>
+                  )}
                 </div>
               </div>
             )}
@@ -356,6 +618,9 @@ export const App: React.FC = () => {
                   <EvidenceDisclosure
                     candidate={rec}
                     comparison={result.comparison_with_fastest_eta}
+                    query={result.query}
+                    provenance={result.provenance}
+                    telemetryDiagnostics={result.telemetry_diagnostics}
                   />
                 )}
 

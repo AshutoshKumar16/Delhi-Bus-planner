@@ -6,6 +6,7 @@ export interface JourneyRecommendRequest {
   from: string;
   to: string;
   reach_by: string | number;
+  mode?: 'live' | 'replay';
   prediction_time?: number;
 }
 
@@ -90,6 +91,37 @@ export interface FastestEtaComparison {
   };
 }
 
+export interface ModelProvenanceMetadata {
+  regime: string;
+  provenance_verified: boolean;
+  is_authoritative: boolean;
+  in_sample_leakage: boolean | null;
+  retrospective_model: boolean | null;
+  production_activation_verified: boolean;
+}
+
+export interface TelemetryDiagnosticsMetadata {
+  total_rows_raw: number;
+  eligible_rows_retained: number;
+  future_rows_discarded: number;
+  nan_rows_discarded: number;
+  newest_vehicle_ts_unix: number | null;
+  fleet_telemetry_lag_seconds: number | null;
+}
+
+export interface JourneyRecommendQuery {
+  origin_stop: string;
+  destination_stop: string;
+  reach_by_formatted: string;
+  reach_by_unix: number;
+  prediction_time_formatted: string;
+  prediction_timestamp_unix: number;
+  time_budget_minutes: number;
+  telemetry_mode?: 'live' | 'replay' | string;
+  snapshot_path?: string;
+  snapshot_age_seconds?: number;
+}
+
 export interface JourneyRecommendResponse {
   status: 'success' | 'error';
   system_state:
@@ -101,15 +133,7 @@ export interface JourneyRecommendResponse {
     | 'INSUFFICIENT_DATA'
     | string;
   message?: string;
-  query: {
-    origin_stop: string;
-    destination_stop: string;
-    reach_by_formatted: string;
-    reach_by_unix: number;
-    prediction_time_formatted: string;
-    prediction_timestamp_unix: number;
-    time_budget_minutes: number;
-  };
+  query: JourneyRecommendQuery;
   recommended_candidate: CandidateBus | null;
   alternative_candidates: CandidateBus[];
   unreliable_candidates?: CandidateBus[];
@@ -120,6 +144,8 @@ export interface JourneyRecommendResponse {
     rejected_candidates_count: number;
     execution_time_ms: number;
   };
+  provenance?: ModelProvenanceMetadata;
+  telemetry_diagnostics?: TelemetryDiagnosticsMetadata;
   error_type?: string;
 }
 
@@ -132,7 +158,54 @@ export interface HealthCheckResponse {
     reconstructed_routes_indexed: number;
     route_segments_indexed: number;
     distinct_stop_keys_indexed: number;
+    indexed_stop_ids?: number;
+    indexed_stop_names?: number;
   };
   timestamp_formatted: string;
   timestamp_unix: number;
+}
+
+export interface StopSearchResult {
+  stop_id: string;
+  display_name: string;
+  name_normalized: string;
+  lat: number;
+  lon: number;
+  route_direction_count: number;
+}
+
+export interface StopSearchResponse {
+  status: 'success' | 'error';
+  query: string;
+  results_count: number;
+  limit: number;
+  stops: StopSearchResult[];
+  message?: string;
+  error_type?: string;
+}
+
+export interface ReachableDestination {
+  stop_id: string;
+  display_name: string;
+  name_normalized: string;
+  serving_direction_count: number;
+}
+
+export interface ReachableDestinationsResponse {
+  status: 'success' | 'error';
+  origin: {
+    stop_id: string;
+    display_name: string;
+    name_normalized?: string;
+    lat: number;
+    lon: number;
+    route_direction_count?: number;
+  };
+  connectivity_type: 'structural_network';
+  disclosure: string;
+  results_count: number;
+  limit: number;
+  destinations: ReachableDestination[];
+  message?: string;
+  error_type?: string;
 }

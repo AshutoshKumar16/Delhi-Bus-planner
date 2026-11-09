@@ -11,6 +11,35 @@ export interface CombineDateTimeResult {
 }
 
 /**
+ * Indian Standard Time (IST) offset relative to UTC: +05:30 (+19,800 seconds).
+ * Delhi Bus transit operations and schedules are anchored to IST.
+ */
+export const IST_OFFSET_SECONDS = 19800; // 5 hours 30 minutes in seconds
+export const IST_OFFSET_MS = IST_OFFSET_SECONDS * 1000;
+
+/**
+ * Extracts year, month (0-indexed), day, hours, minutes, seconds of a Date in IST.
+ */
+export function getIstDateParts(d: Date): {
+  year: number;
+  month: number;
+  day: number;
+  hours: number;
+  minutes: number;
+  seconds: number;
+} {
+  const istDate = new Date(d.getTime() + IST_OFFSET_MS);
+  return {
+    year: istDate.getUTCFullYear(),
+    month: istDate.getUTCMonth(),
+    day: istDate.getUTCDate(),
+    hours: istDate.getUTCHours(),
+    minutes: istDate.getUTCMinutes(),
+    seconds: istDate.getUTCSeconds(),
+  };
+}
+
+/**
  * Returns today's local date formatted as "YYYY-MM-DD" for HTML5 date inputs.
  */
 export function toLocalDateString(d: Date = new Date()): string {
@@ -54,24 +83,25 @@ export function getDefaultReachByTime(d: Date = new Date()): string {
 
 /**
  * Formats a backend timestamp (e.g. "2026-10-06 11:00:00 IST" or "11:00")
- * into human-friendly 12-hour clock format (e.g. "11:00 AM").
+ * into human-friendly 12-hour clock format (e.g. "11:00 AM" or "7:05:02 AM").
  */
 export function formatTimeTo12Hour(fullStr?: string): string {
   if (!fullStr) return '--:--';
-  const match = fullStr.match(/(?:(\d{4}-\d{2}-\d{2})\s+)?(\d{1,2}):(\d{2})(?::\d{2})?\s*(AM|PM|IST)?/i);
+  const match = fullStr.match(/(?:(\d{4}-\d{2}-\d{2})\s+)?(\d{1,2}):(\d{2})(?::(\d{2}))?\s*(AM|PM|IST)?/i);
   if (match) {
     let hours = parseInt(match[2], 10);
     const minutes = match[3];
-    const modifier = match[4]?.toUpperCase();
+    const seconds = match[4];
+    const modifier = match[5]?.toUpperCase();
 
     if (modifier === 'AM' || modifier === 'PM') {
-      return `${hours}:${minutes} ${modifier}`;
+      return seconds ? `${hours}:${minutes}:${seconds} ${modifier}` : `${hours}:${minutes} ${modifier}`;
     }
 
     const ampm = hours >= 12 ? 'PM' : 'AM';
     hours = hours % 12;
     if (hours === 0) hours = 12;
-    return `${hours}:${minutes} ${ampm}`;
+    return seconds ? `${hours}:${minutes}:${seconds} ${ampm}` : `${hours}:${minutes} ${ampm}`;
   }
   return fullStr;
 }
@@ -83,21 +113,15 @@ export function formatHumanDeadline(
   targetDate: Date,
   referenceDate: Date = new Date()
 ): string {
+  const targetParts = getIstDateParts(targetDate);
+  const refParts = getIstDateParts(referenceDate);
+
   const time12h = formatTimeTo12Hour(
-    `${targetDate.getHours()}:${String(targetDate.getMinutes()).padStart(2, '0')}`
+    `${targetParts.hours}:${String(targetParts.minutes).padStart(2, '0')}`
   );
 
-  const refMidnight = new Date(
-    referenceDate.getFullYear(),
-    referenceDate.getMonth(),
-    referenceDate.getDate()
-  ).getTime();
-
-  const targetMidnight = new Date(
-    targetDate.getFullYear(),
-    targetDate.getMonth(),
-    targetDate.getDate()
-  ).getTime();
+  const refMidnight = Date.UTC(refParts.year, refParts.month, refParts.day);
+  const targetMidnight = Date.UTC(targetParts.year, targetParts.month, targetParts.day);
 
   const diffDays = Math.round((targetMidnight - refMidnight) / (24 * 60 * 60 * 1000));
 
@@ -109,7 +133,7 @@ export function formatHumanDeadline(
     return `Yesterday · ${time12h}`;
   } else {
     const monthNames = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
-    return `${monthNames[targetDate.getMonth()]} ${targetDate.getDate()} · ${time12h}`;
+    return `${monthNames[targetParts.month]} ${targetParts.day} · ${time12h}`;
   }
 }
 
@@ -150,50 +174,59 @@ export function formatArrivalWindow(
   if (!intervalMinutes || intervalMinutes.length < 2 || !predTsUnix) return null;
   const startTs = predTsUnix + Math.round(intervalMinutes[0] * 60);
   const endTs = predTsUnix + Math.round(intervalMinutes[1] * 60);
-  const startDate = new Date(startTs * 1000);
-  const endDate = new Date(endTs * 1000);
+  const startIst = new Date(startTs * 1000 + IST_OFFSET_MS);
+  const endIst = new Date(endTs * 1000 + IST_OFFSET_MS);
   const startStr = formatTimeTo12Hour(
-    `${startDate.getHours()}:${String(startDate.getMinutes()).padStart(2, '0')}`
+    `${startIst.getUTCHours()}:${String(startIst.getUTCMinutes()).padStart(2, '0')}`
   );
   const endStr = formatTimeTo12Hour(
-    `${endDate.getHours()}:${String(endDate.getMinutes()).padStart(2, '0')}`
+    `${endIst.getUTCHours()}:${String(endIst.getUTCMinutes()).padStart(2, '0')}`
   );
   return `${startStr} – ${endStr}`;
 }
 
 /**
- * Combines date string ("YYYY-MM-DD") and time string ("HH:mm") into a local Date,
- * validates against past deadlines, and converts to Unix seconds.
+ * Verified out-of-sample historical replay timestamp:
+ * 1791250502 Unix seconds (2026-10-06 07:05:02 IST).
  */
-export function combineDateAndTimeToUnix(
+export const VERIFIED_REPLAY_TIMESTAMP_UNIX = 1791250502;
+export const VERIFIED_REPLAY_DATE = '2026-10-06';
+export const VERIFIED_REPLAY_TIME = '07:05:02';
+
+/**
+ * Parses a date string ("YYYY-MM-DD") and time string ("HH:mm" or "HH:mm:ss")
+ * into a local Date and Unix seconds in the local timezone (IST).
+ * Does not perform relative future-deadline validation.
+ */
+export function parseDateTimeToUnix(
   dateStr: string,
   timeStr: string,
-  referenceDate: Date = new Date()
+  referenceDateForFormatting: Date = new Date()
 ): CombineDateTimeResult {
   const trimmedDate = (dateStr || '').trim();
   const trimmedTime = (timeStr || '').trim();
 
   if (!trimmedDate) {
-    return { error: 'Please select a reach-by date.' };
+    return { error: 'Please select a date.' };
   }
   if (!trimmedTime) {
-    return { error: 'Please select a reach-by time.' };
+    return { error: 'Please select a time.' };
   }
 
   // Parse YYYY-MM-DD
   const dateParts = trimmedDate.split('-');
   if (dateParts.length !== 3) {
-    return { error: 'Invalid date format. Please select a valid date.' };
+    return { error: 'Invalid date format. Please select a valid date (YYYY-MM-DD).' };
   }
   const year = parseInt(dateParts[0], 10);
   const month = parseInt(dateParts[1], 10) - 1;
   const day = parseInt(dateParts[2], 10);
 
-  // Parse HH:mm (HTML5 time format) or with seconds/12h
+  // Parse HH:mm or HH:mm:ss (HTML5 time format with step=1, or with 12h AM/PM modifier)
   const timeRegex = /^(\d{1,2}):(\d{2})(?::(\d{2}))?\s*([aApP][mM])?$/;
   const match = trimmedTime.match(timeRegex);
   if (!match) {
-    return { error: 'Invalid time format. Please select a valid time.' };
+    return { error: 'Invalid time format. Please select a valid time (HH:mm or HH:mm:ss).' };
   }
 
   let hours = parseInt(match[1], 10);
@@ -220,25 +253,65 @@ export function combineDateAndTimeToUnix(
     }
   }
 
-  const targetDate = new Date(year, month, day, hours, minutes, seconds, 0);
-
-  if (isNaN(targetDate.getTime())) {
+  // Validate calendar date validity via Date.UTC to prevent month/day rollover (e.g. Feb 31)
+  const utcCandidateMs = Date.UTC(year, month, day, hours, minutes, seconds, 0);
+  if (isNaN(utcCandidateMs)) {
+    return { error: 'Invalid date or time specified.' };
+  }
+  const checkDate = new Date(utcCandidateMs);
+  if (
+    checkDate.getUTCFullYear() !== year ||
+    checkDate.getUTCMonth() !== month ||
+    checkDate.getUTCDate() !== day
+  ) {
     return { error: 'Invalid date or time specified.' };
   }
 
-  const humanStr = formatHumanDeadline(targetDate, referenceDate);
+  // Convert IST calendar instant into UTC epoch milliseconds
+  // IST = UTC + 5h 30m => UTC epoch ms = Date.UTC(year, month, day, hours, minutes, seconds) - 19,800,000
+  const epochMs = utcCandidateMs - IST_OFFSET_MS;
+  const targetDate = new Date(epochMs);
+  const humanStr = formatHumanDeadline(targetDate, referenceDateForFormatting);
 
-  // Validate that deadline is not in the past relative to referenceDate
-  if (targetDate.getTime() <= referenceDate.getTime()) {
+  return {
+    unixSeconds: Math.floor(epochMs / 1000),
+    targetDate,
+    formattedHuman: humanStr,
+  };
+}
+
+/**
+ * Combines date string ("YYYY-MM-DD") and time string ("HH:mm") into a local Date,
+ * validates against past deadlines relative to minReferenceDate, and converts to Unix seconds.
+ */
+export function combineDateAndTimeToUnix(
+  dateStr: string,
+  timeStr: string,
+  minReferenceDate: Date = new Date(),
+  minReferenceLabel?: string
+): CombineDateTimeResult {
+  const parsed = parseDateTimeToUnix(dateStr, timeStr, minReferenceDate);
+  if (parsed.error || !parsed.targetDate || parsed.unixSeconds == null) {
+    return { error: parsed.error || 'Please provide a valid reach-by date and time.' };
+  }
+
+  const targetDate = parsed.targetDate;
+  const humanStr = parsed.formattedHuman || formatHumanDeadline(targetDate, minReferenceDate);
+
+  // Validate that deadline is strictly in the future relative to minReferenceDate
+  if (targetDate.getTime() <= minReferenceDate.getTime()) {
+    const errorMsg = minReferenceLabel
+      ? `The selected reach-by time (${humanStr}) must be after the ${minReferenceLabel}.`
+      : `The selected reach-by time (${humanStr}) has already passed. Please select a future date and time.`;
     return {
-      error: `The selected reach-by time (${humanStr}) has already passed. Please select a future date and time.`,
+      error: errorMsg,
       targetDate,
       formattedHuman: humanStr,
     };
   }
 
   return {
-    unixSeconds: Math.floor(targetDate.getTime() / 1000),
+    unixSeconds: parsed.unixSeconds,
     targetDate,
     formattedHuman: humanStr,
   };

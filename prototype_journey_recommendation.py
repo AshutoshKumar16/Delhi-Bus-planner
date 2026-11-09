@@ -446,7 +446,27 @@ class JourneyRecommendationEngine:
         vid = str(vehicle_row["vehicle_id"])
         lat = float(vehicle_row["latitude"])
         lon = float(vehicle_row["longitude"])
-        v_ts = int(vehicle_row["vehicle_ts_unix"])
+        raw_v_ts = vehicle_row.get("vehicle_ts_unix")
+        if pd.isna(raw_v_ts) or raw_v_ts is None or raw_v_ts == "":
+            return {
+                "route_id": rid,
+                "direction_id": did,
+                "vehicle_id": vid,
+                "status": "INVALID_TIMESTAMP",
+                "telemetry_age_seconds": None,
+                "reason": "Missing or null vehicle_ts_unix",
+            }
+        try:
+            v_ts = int(float(raw_v_ts))
+        except (ValueError, TypeError):
+            return {
+                "route_id": rid,
+                "direction_id": did,
+                "vehicle_id": vid,
+                "status": "INVALID_TIMESTAMP",
+                "telemetry_age_seconds": None,
+                "reason": f"Non-numeric vehicle_ts_unix: {raw_v_ts!r}",
+            }
 
         raw_speed = vehicle_row.get("speed")
         speed_val = None
@@ -457,6 +477,15 @@ class JourneyRecommendationEngine:
                 speed_val = None
 
         telemetry_age_s = prediction_ts - v_ts
+        if telemetry_age_s < 0:
+            return {
+                "route_id": rid,
+                "direction_id": did,
+                "vehicle_id": vid,
+                "status": "FUTURE_TELEMETRY",
+                "telemetry_age_seconds": telemetry_age_s,
+                "reason": f"Telemetry timestamp {v_ts} is in the future relative to prediction time {prediction_ts} (age: {telemetry_age_s}s)",
+            }
         if telemetry_age_s > MAX_TELEMETRY_AGE_S:
             return {
                 "route_id": rid,
