@@ -8,10 +8,9 @@ import type {
 } from './types';
 import {
   combineDateAndTimeToUnix,
-  getDefaultReachByTime,
+  getDefaultReachByDateAndTime,
   getHumanDeadlinePreview,
   parseDateTimeToUnix,
-  toLocalDateString,
   VERIFIED_REPLAY_DATE,
   VERIFIED_REPLAY_TIME,
 } from './timeUtils';
@@ -125,12 +124,13 @@ export const App: React.FC = () => {
   const isDesktop = useMediaQuery('(min-width: 1024px)');
 
   // Form State
+  const [initialLiveDeadline] = useState(() => getDefaultReachByDateAndTime());
   const [fromStop, setFromStop] = useState<string>('Mahindra Park');
   const [fromStopId, setFromStopId] = useState<string | null>(null);
   const [toStop, setToStop] = useState<string>('Azadpur');
   const [toStopId, setToStopId] = useState<string | null>(null);
-  const [reachByDate, setReachByDate] = useState<string>(() => toLocalDateString());
-  const [reachByTime, setReachByTime] = useState<string>(() => getDefaultReachByTime());
+  const [reachByDate, setReachByDate] = useState<string>(initialLiveDeadline.reachByDate);
+  const [reachByTime, setReachByTime] = useState<string>(initialLiveDeadline.reachByTime);
 
   // Telemetry Mode ('live' | 'replay')
   const [telemetryMode, setTelemetryMode] = useState<'live' | 'replay'>('live');
@@ -182,9 +182,11 @@ export const App: React.FC = () => {
       setReachByDate(syncDate);
       setReachByTime(syncTime);
     } else {
-      if (reachByDate < toLocalDateString()) {
-        setReachByDate(toLocalDateString());
-        setReachByTime(getDefaultReachByTime());
+      const liveCheck = combineDateAndTimeToUnix(reachByDate, reachByTime, new Date());
+      if (liveCheck.error) {
+        const fresh = getDefaultReachByDateAndTime();
+        setReachByDate(fresh.reachByDate);
+        setReachByTime(fresh.reachByTime);
       }
     }
   };

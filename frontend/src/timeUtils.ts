@@ -58,16 +58,24 @@ export function toTomorrowDateString(d: Date = new Date()): string {
   return toLocalDateString(tomorrow);
 }
 
+export interface DefaultReachByDateAndTime {
+  reachByDate: string;
+  reachByTime: string;
+}
+
 /**
- * Returns default reach-by time formatted as "HH:mm" for HTML5 time inputs.
- * Defaults to "11:00" for daytime planning, or 1 hour in future if already past 11:00.
+ * Computes default reach-by date and time atomically so that
+ * when the computed time rolls over midnight (e.g. 23:42 + 1h -> 00:45),
+ * reachByDate automatically advances to tomorrow, preventing past-deadline errors.
  */
-export function getDefaultReachByTime(d: Date = new Date()): string {
+export function getDefaultReachByDateAndTime(d: Date = new Date()): DefaultReachByDateAndTime {
   const hours = d.getHours();
   if (hours < 10) {
-    return '11:00';
+    return {
+      reachByDate: toLocalDateString(d),
+      reachByTime: '11:00',
+    };
   }
-  // Otherwise 1 hour ahead rounded to next 15 mins
   const future = new Date(d.getTime() + 60 * 60 * 1000);
   const roundedMins = Math.ceil(future.getMinutes() / 15) * 15;
   if (roundedMins === 60) {
@@ -76,9 +84,19 @@ export function getDefaultReachByTime(d: Date = new Date()): string {
   } else {
     future.setMinutes(roundedMins);
   }
-  const hStr = String(future.getHours()).padStart(2, '0');
-  const mStr = String(future.getMinutes()).padStart(2, '0');
-  return `${hStr}:${mStr}`;
+  future.setSeconds(0, 0);
+  return {
+    reachByDate: toLocalDateString(future),
+    reachByTime: `${String(future.getHours()).padStart(2, '0')}:${String(future.getMinutes()).padStart(2, '0')}`,
+  };
+}
+
+/**
+ * Returns default reach-by time formatted as "HH:mm" for HTML5 time inputs.
+ * Defaults to "11:00" for daytime planning, or 1 hour in future if already past 11:00.
+ */
+export function getDefaultReachByTime(d: Date = new Date()): string {
+  return getDefaultReachByDateAndTime(d).reachByTime;
 }
 
 /**

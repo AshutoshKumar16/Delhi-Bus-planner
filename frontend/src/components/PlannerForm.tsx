@@ -1,7 +1,10 @@
-import React, { useEffect, useId, useRef, useState } from 'react';
+import React, { useEffect, useId, useMemo, useRef, useState } from 'react';
 import { fetchReachableDestinations, fetchStopSearch } from '../api';
 import {
+  combineDateAndTimeToUnix,
+  getDefaultReachByDateAndTime,
   getDefaultReachByTime,
+  parseDateTimeToUnix,
   toLocalDateString,
   toTomorrowDateString,
   VERIFIED_REPLAY_DATE,
@@ -237,8 +240,17 @@ export const PlannerForm: React.FC<PlannerFormProps> = ({
       setReachByDate(VERIFIED_REPLAY_DATE);
       setReachByTime('07:35:00');
     } else {
-      setReachByDate(isTomorrow ? toTomorrowDateString() : toLocalDateString());
-      setReachByTime(customTime || getDefaultReachByTime());
+      if (isTomorrow) {
+        setReachByDate(toTomorrowDateString());
+        setReachByTime(customTime || getDefaultReachByTime());
+      } else if (customTime) {
+        setReachByDate(toLocalDateString());
+        setReachByTime(customTime);
+      } else {
+        const liveDefault = getDefaultReachByDateAndTime();
+        setReachByDate(liveDefault.reachByDate);
+        setReachByTime(liveDefault.reachByTime);
+      }
     }
   };
 
@@ -246,6 +258,49 @@ export const PlannerForm: React.FC<PlannerFormProps> = ({
     setShowFromDropdown(false);
     setShowToDropdown(false);
     onSwap();
+  };
+
+  const deadlineValidationError = useMemo<string | null>(() => {
+    if (!reachByDate || !reachByTime) return null;
+    if (telemetryMode === 'replay') {
+      if (!replayDate || !replayTime) return null;
+      const parsedPred = parseDateTimeToUnix(replayDate, replayTime);
+      if (parsedPred.error || !parsedPred.targetDate) return null;
+      const parsedDeadline = combineDateAndTimeToUnix(
+        reachByDate,
+        reachByTime,
+        parsedPred.targetDate,
+        'historical observation time'
+      );
+      return parsedDeadline.error || null;
+    }
+    const parsedDeadline = combineDateAndTimeToUnix(reachByDate, reachByTime, new Date());
+    return parsedDeadline.error || null;
+  }, [reachByDate, reachByTime, telemetryMode, replayDate, replayTime]);
+
+  const minReachByTime = useMemo<string | undefined>(() => {
+    if (telemetryMode === 'replay') {
+      if (reachByDate === replayDate && replayTime) {
+        return replayTime.slice(0, 5);
+      }
+      return undefined;
+    }
+    const today = toLocalDateString();
+    if (reachByDate === today) {
+      const now = new Date();
+      const hStr = String(now.getHours()).padStart(2, '0');
+      const mStr = String(now.getMinutes()).padStart(2, '0');
+      return `${hStr}:${mStr}`;
+    }
+    return undefined;
+  }, [telemetryMode, reachByDate, replayDate, replayTime]);
+
+  const handleSubmit = (e: React.FormEvent) => {
+    e.preventDefault();
+    if (deadlineValidationError) {
+      return;
+    }
+    onSearch(e);
   };
 
   return (
@@ -277,7 +332,7 @@ export const PlannerForm: React.FC<PlannerFormProps> = ({
         </div>
       )}
 
-      <form onSubmit={onSearch} className="planner-form" noValidate>
+      <form onSubmit={handleSubmit} className="planner-form" noValidate>
         {/* Replay Historical Observation Time (P) */}
         {telemetryMode === 'replay' && (
           <div className="form-field-group historical-time-group">
@@ -667,19 +722,42 @@ export const PlannerForm: React.FC<PlannerFormProps> = ({
                 type="time"
                 className="native-time-input"
                 value={reachByTime}
+                min={minReachByTime}
                 onChange={(e) => setReachByTime(e.target.value)}
                 disabled={loading}
                 required
               />
             </div>
           </div>
+          {deadlineValidationError && (
+            <div className="reach-by-inline-error" role="alert">
+              <svg
+                width="14"
+                height="14"
+                viewBox="0 0 24 24"
+                fill="none"
+                stroke="currentColor"
+                strokeWidth="2"
+                strokeLinecap="round"
+                strokeLinejoin="round"
+                aria-hidden="true"
+              >
+                <circle cx="12" cy="12" r="10" />
+                <line x1="12" y1="8" x2="12" y2="12" />
+                <line x1="12" y1="16" x2="12.01" y2="16" />
+              </svg>
+              <span>{deadlineValidationError}</span>
+            </div>
+          )}
         </div>
 
         {/* Full-width primary action button */}
         <button
           type="submit"
           className="submit-button"
-          disabled={loading}
+          disabled={loading || Boolean(deadlineValidationError)}
+          aria-disabled={loading || Boolean(deadlineValidationError)}
+          title={deadlineValidationError || undefined}
         >
           {loading ? (
             <span className="btn-loading-content">

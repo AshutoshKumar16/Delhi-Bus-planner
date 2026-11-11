@@ -580,6 +580,19 @@
   flex-direction: column;
 }
 
+.reach-by-inline-error {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 0.72rem;
+  color: var(--rel-low-text);
+  background-color: var(--rel-low-bg);
+  border: 1px solid var(--rel-low-border);
+  border-radius: var(--radius-sm);
+  padding: 4px 8px;
+  margin-top: 4px;
+}
+
 /* Primary Button */
 .submit-button {
   width: 100%;

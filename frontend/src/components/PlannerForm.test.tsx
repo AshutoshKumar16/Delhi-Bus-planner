@@ -49,10 +49,13 @@ function makeDestResponse(stopId: string, name: string): ReachableDestinationsRe
 // ---------------------------------------------------------------------------
 
 beforeEach(() => {
+  vi.useFakeTimers({ toFake: ['Date'] });
+  vi.setSystemTime(new Date(2026, 10, 9, 8, 0, 0));
   vi.restoreAllMocks();
 });
 
 afterEach(() => {
+  vi.useRealTimers();
   vi.restoreAllMocks();
 });
 
@@ -425,5 +428,217 @@ describe('PlannerForm – stale downstream destinations fix', () => {
 
     // No Azadpur data should ever appear
     expect(screen.queryByText('Azadpur Downstream')).not.toBeInTheDocument();
+  });
+
+  // -------------------------------------------------------------------------
+  // 6. Displays inline validation alert when a past deadline is selected
+  // -------------------------------------------------------------------------
+  it('displays inline validation alert when a past deadline is selected in live mode', () => {
+    // Current simulated time: 2026-11-09 08:00:00
+    // Selected deadline: 2026-11-09 07:00 (1 hour in the past)
+    render(
+      <PlannerForm
+        fromStop="Mahindra Park"
+        setFromStop={() => {}}
+        toStop="Azadpur"
+        setToStop={() => {}}
+        reachByDate="2026-11-09"
+        setReachByDate={() => {}}
+        reachByTime="07:00"
+        setReachByTime={() => {}}
+        humanDeadlinePreview="Today · 7:00 AM"
+        loading={false}
+        onSearch={() => {}}
+        onSwap={() => {}}
+        telemetryMode="live"
+      />
+    );
+
+    const alertEl = screen.getByRole('alert');
+    expect(alertEl).toBeInTheDocument();
+    expect(alertEl.textContent).toMatch(/already passed/i);
+  });
+
+  // -------------------------------------------------------------------------
+  // 7. Disables submit button and prevents submission when deadline is invalid
+  // -------------------------------------------------------------------------
+  it('disables submit button and prevents onSearch call when deadline is in the past', async () => {
+    const onSearchMock = vi.fn();
+
+    render(
+      <PlannerForm
+        fromStop="Mahindra Park"
+        setFromStop={() => {}}
+        toStop="Azadpur"
+        setToStop={() => {}}
+        reachByDate="2026-11-09"
+        setReachByDate={() => {}}
+        reachByTime="07:00"
+        setReachByTime={() => {}}
+        humanDeadlinePreview="Today · 7:00 AM"
+        loading={false}
+        onSearch={onSearchMock}
+        onSwap={() => {}}
+        telemetryMode="live"
+      />
+    );
+
+    const submitBtn = screen.getByRole('button', { name: /find best routes/i });
+    expect(submitBtn).toBeDisabled();
+
+    // Clicking the disabled button should not trigger onSearch
+    await act(async () => {
+      await userEvent.click(submitBtn);
+    });
+
+    expect(onSearchMock).not.toHaveBeenCalled();
+  });
+
+  // -------------------------------------------------------------------------
+  // 8. Selecting a future deadline clears inline error and enables submission
+  // -------------------------------------------------------------------------
+  it('clears error and allows search submission when a future deadline is selected', async () => {
+    const onSearchMock = vi.fn();
+
+    // Tomorrow at 15:00 is strictly in the future
+    render(
+      <PlannerForm
+        fromStop="Mahindra Park"
+        setFromStop={() => {}}
+        toStop="Azadpur"
+        setToStop={() => {}}
+        reachByDate="2026-11-10"
+        setReachByDate={() => {}}
+        reachByTime="15:00"
+        setReachByTime={() => {}}
+        humanDeadlinePreview="Tomorrow · 3:00 PM"
+        loading={false}
+        onSearch={onSearchMock}
+        onSwap={() => {}}
+        telemetryMode="live"
+      />
+    );
+
+    // No error alert should be present
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument();
+
+    const submitBtn = screen.getByRole('button', { name: /find best routes/i });
+    expect(submitBtn).not.toBeDisabled();
+
+    await act(async () => {
+      await userEvent.click(submitBtn);
+    });
+
+    expect(onSearchMock).toHaveBeenCalledTimes(1);
+  });
+
+  // -------------------------------------------------------------------------
+  // 9. Replay mode blocks submission when deadline is before observation time
+  // -------------------------------------------------------------------------
+  it('blocks submission in replay mode when deadline is prior to observation time', async () => {
+    const onSearchMock = vi.fn();
+
+    render(
+      <PlannerForm
+        fromStop="Mahindra Park"
+        setFromStop={() => {}}
+        toStop="Azadpur"
+        setToStop={() => {}}
+        reachByDate="2026-10-06"
+        setReachByDate={() => {}}
+        reachByTime="06:30:00" // Before 07:05:02 observation time
+        setReachByTime={() => {}}
+        humanDeadlinePreview={null}
+        loading={false}
+        onSearch={onSearchMock}
+        onSwap={() => {}}
+        telemetryMode="replay"
+        replayDate="2026-10-06"
+        replayTime="07:05:02"
+      />
+    );
+
+    const alertEl = screen.getByRole('alert');
+    expect(alertEl).toBeInTheDocument();
+    expect(alertEl.textContent).toMatch(/must be after the historical observation time/i);
+
+    const submitBtn = screen.getByRole('button', { name: /find best routes/i });
+    expect(submitBtn).toBeDisabled();
+
+    await act(async () => {
+      await userEvent.click(submitBtn);
+    });
+
+    expect(onSearchMock).not.toHaveBeenCalled();
+  });
+
+  // -------------------------------------------------------------------------
+  // 10. Real bug reproduction at 11:42 PM: today is blocked, tomorrow is allowed
+  // -------------------------------------------------------------------------
+  it('reproduces 11:42 PM bug: blocks today at 00:45, permits tomorrow at 00:45', async () => {
+    // Set system time to 11 Nov 2026 at 23:42 IST
+    vi.setSystemTime(new Date(2026, 10, 11, 23, 42, 0));
+    const onSearchMock = vi.fn();
+
+    // 10a. Bugged state: Today (2026-11-11) + 00:45 (in the past)
+    const { rerender } = render(
+      <PlannerForm
+        fromStop="Mahindra Park"
+        setFromStop={() => {}}
+        toStop="Azadpur"
+        setToStop={() => {}}
+        reachByDate="2026-11-11"
+        setReachByDate={() => {}}
+        reachByTime="00:45"
+        setReachByTime={() => {}}
+        humanDeadlinePreview="Today · 12:45 AM"
+        loading={false}
+        onSearch={onSearchMock}
+        onSwap={() => {}}
+        telemetryMode="live"
+      />
+    );
+
+    // Must show alert and disable submit
+    const alertEl = screen.getByRole('alert');
+    expect(alertEl).toBeInTheDocument();
+    expect(alertEl.textContent).toMatch(/already passed/i);
+
+    const submitBtn = screen.getByRole('button', { name: /find best routes/i });
+    expect(submitBtn).toBeDisabled();
+
+    await act(async () => {
+      await userEvent.click(submitBtn);
+    });
+    expect(onSearchMock).not.toHaveBeenCalled();
+
+    // 10b. Fixed state: Tomorrow (2026-11-12) + 00:45 (in the future)
+    rerender(
+      <PlannerForm
+        fromStop="Mahindra Park"
+        setFromStop={() => {}}
+        toStop="Azadpur"
+        setToStop={() => {}}
+        reachByDate="2026-11-12"
+        setReachByDate={() => {}}
+        reachByTime="00:45"
+        setReachByTime={() => {}}
+        humanDeadlinePreview="Tomorrow · 12:45 AM"
+        loading={false}
+        onSearch={onSearchMock}
+        onSwap={() => {}}
+        telemetryMode="live"
+      />
+    );
+
+    // Alert must clear and re-queried submit button must be enabled
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument();
+    const updatedSubmitBtn = screen.getByRole('button', { name: /find best routes/i });
+    expect(updatedSubmitBtn).not.toBeDisabled();
+
+    await act(async () => {
+      await userEvent.click(updatedSubmitBtn);
+    });
+    expect(onSearchMock).toHaveBeenCalledTimes(1);
   });
 });
