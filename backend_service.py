@@ -884,6 +884,7 @@ def recommend_journey_endpoint():
             "candidate_routes_count": rec.get("candidate_routes_count", 0),
             "viable_candidates_count": rec.get("viable_candidates_count", 0),
             "rejected_candidates_count": rec.get("rejected_candidates_count", 0),
+            "rejection_breakdown": rec.get("rejection_breakdown", {}),
             "execution_time_ms": exec_time_ms,
         },
     }

@@ -55,6 +55,7 @@ Core Principles & Operational Architecture:
 """
 
 import argparse
+from collections import Counter, defaultdict
 import glob
 import json
 import math
@@ -217,20 +218,31 @@ class JourneyRecommendationEngine:
                 if dest_key in k:
                     to_entries.extend(entries)
 
-        from_map = {(rid, did): idx for (rid, did, idx) in from_entries}
-        to_map = {(rid, did): idx for (rid, did, idx) in to_entries}
+        from_map = defaultdict(list)
+        for (rid, did, idx) in from_entries:
+            from_map[(rid, did)].append(idx)
+
+        to_map = defaultdict(list)
+        for (rid, did, idx) in to_entries:
+            to_map[(rid, did)].append(idx)
 
         common_keys = set(from_map.keys()).intersection(set(to_map.keys()))
 
         candidate_routes = []
         for rid, did in common_keys:
-            idx_from = from_map[(rid, did)]
-            idx_to = to_map[(rid, did)]
+            r_data = self.routes.get(rid, {})
+            d_data = r_data.get("directions", {}).get(str(did), {})
+            cum_dists = d_data.get("stop_cum_dists", [])
 
-            if idx_from < idx_to:
-                r_data = self.routes.get(rid, {})
-                d_data = r_data.get("directions", {}).get(str(did), {})
-                cum_dists = d_data.get("stop_cum_dists", [])
+            # Discover all valid forward pairs (idx_from < idx_to) without dict overwrites
+            pairs = set(
+                (idx_from, idx_to)
+                for idx_from in from_map[(rid, did)]
+                for idx_to in to_map[(rid, did)]
+                if idx_from < idx_to
+            )
+
+            for idx_from, idx_to in pairs:
                 dist_between = (
                     float(cum_dists[idx_to] - cum_dists[idx_from])
                     if cum_dists
@@ -816,9 +828,22 @@ class JourneyRecommendationEngine:
         # Map candidate routes by (route_id, direction_id)
         route_map = {(r["route_id"], r["direction_id"]): r for r in candidate_routes}
 
-        # 3. Evaluate each vehicle
+        # 3. Evaluate each vehicle across all matching route directions/legs
         evaluated_candidates: List[Dict[str, Any]] = []
         rejected_candidates: List[Dict[str, Any]] = []
+
+        # Diagnostic ordering for selecting the most actionable failure reason
+        def _failure_priority(fail_res: Dict[str, Any]) -> int:
+            status = fail_res.get("status")
+            priority_map = {
+                "PHYSICALLY_IMPOSSIBLE_DEADLINE": 1,
+                "BUS_ALREADY_PASSED_ORIGIN": 2,
+                "TOO_FAR_UPSTREAM": 3,
+                "INSUFFICIENT_DATA": 4,
+                "STALE_TELEMETRY": 5,
+                "OFF_CORRIDOR": 6,
+            }
+            return priority_map.get(status, 10)
 
         # Dedup vehicles by vehicle_id across candidate routes
         seen_vehicles = set()
@@ -830,17 +855,37 @@ class JourneyRecommendationEngine:
 
             # Find matching directions for this route
             r_matching = [r for r in candidate_routes if r["route_id"] == rid]
+            best_eval: Optional[Dict[str, Any]] = None
+            candidate_failures: List[Dict[str, Any]] = []
+
             for r_cand in r_matching:
                 eval_res = self.evaluate_candidate_journey(
                     r_cand, row, deadline_ts, prediction_ts
                 )
                 status = eval_res.get("status")
                 if status in ("ESTIMATED", "ESTIMATED_WITH_FALLBACK"):
-                    evaluated_candidates.append(eval_res)
-                    seen_vehicles.add(vid)
-                    break
+                    if best_eval is None:
+                        best_eval = eval_res
+                    else:
+                        p_new = eval_res["deadline_evaluation"]["probability_on_time"]
+                        p_best = best_eval["deadline_evaluation"]["probability_on_time"]
+                        eta_new = eval_res["destination_arrival"]["expected_arrival_timestamp_unix"]
+                        eta_best = best_eval["destination_arrival"]["expected_arrival_timestamp_unix"]
+                        if p_new > p_best or (p_new == p_best and eta_new < eta_best):
+                            best_eval = eval_res
                 else:
-                    rejected_candidates.append(eval_res)
+                    candidate_failures.append(eval_res)
+
+            if best_eval is not None:
+                evaluated_candidates.append(best_eval)
+                seen_vehicles.add(vid)
+            else:
+                if candidate_failures:
+                    best_failure = min(candidate_failures, key=_failure_priority)
+                    rejected_candidates.append(best_failure)
+                seen_vehicles.add(vid)
+
+        rejection_breakdown = dict(Counter(c.get("status") for c in rejected_candidates))
 
         if not evaluated_candidates:
             # Check reasons for rejection
@@ -867,6 +912,9 @@ class JourneyRecommendationEngine:
                     "time_budget_minutes": time_budget_m,
                 },
                 "candidate_routes_count": len(candidate_routes),
+                "viable_candidates_count": 0,
+                "rejected_candidates_count": len(rejected_candidates),
+                "rejection_breakdown": rejection_breakdown,
                 "recommended_option": None,
                 "alternative_options": [],
                 "rejected_candidates": rejected_candidates[:10],
@@ -974,6 +1022,7 @@ class JourneyRecommendationEngine:
             "candidate_routes_count": len(candidate_routes),
             "viable_candidates_count": len(evaluated_candidates),
             "rejected_candidates_count": len(rejected_candidates),
+            "rejection_breakdown": rejection_breakdown,
             "recommended_option": recommended_option,
             "alternative_options": alternatives,
             "unreliable_candidates": unreliable_candidates,
